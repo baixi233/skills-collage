@@ -1,0 +1,3 @@
+.tmp_sync/
+__pycache__/
+*.pyc

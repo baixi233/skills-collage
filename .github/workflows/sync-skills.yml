@@ -1,0 +1,148 @@
+name: Sync third-party skills
+on:
+  schedule:
+    - cron: "0 17 * * *"
+  workflow_dispatch:
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install pyyaml
+
+      - name: Sync skills from config
+        env:
+          GH_TOKEN: ${{ secrets.GH_TOKEN }}
+        run: |
+          python << 'PY'
+          import os, shutil, subprocess, yaml, sys, re
+          from pathlib import Path
+
+          ROOT = Path.cwd()
+          SKILLS_DIR = ROOT / "skills"
+          CONFIG = ROOT / "repos.config.yml"
+          TMP = ROOT / ".tmp_sync"
+
+          if not CONFIG.exists():
+              print("repos.config.yml not found, exit"); sys.exit(1)
+
+          cfg = yaml.safe_load(CONFIG.read_text(encoding="utf-8"))
+          repos_list = cfg.get("repos", [])
+          print(f"Total {len(repos_list)} repos to sync")
+
+          SKILLS_DIR.mkdir(exist_ok=True)
+          TMP.mkdir(exist_ok=True)
+          synced_entries = set()
+
+          def extract_repo_name(git_url: str):
+              match = re.search(r"/([^/]+?)(\.git)?$", git_url)
+              if match:
+                  return match.group(1)
+              raise ValueError(f"Can not parse repo name from {git_url}")
+
+          for item in repos_list:
+              url = item["url"]
+              mode = item.get("mode", "full")
+              subdir = item.get("subdir", "")
+              branch = item.get("branch")
+              manual_name = item.get("name")
+              dir_map = item.get("names", {}) # <--- 修改：读取names配置
+
+              repo_name = extract_repo_name(url)
+              src_clone = TMP / repo_name
+              if src_clone.exists():
+                  shutil.rmtree(src_clone)
+
+              print(f"\n====> Process repo: {url}, mode={mode}")
+              cmd = ["git", "clone", "--depth", "1", "--filter=blob:none"]
+              if branch:
+                  cmd += ["--branch", branch, "--single-branch"]
+              cmd += [url, str(src_clone)]
+
+              token = os.environ.get("GH_TOKEN", "")
+              if token and url.startswith("https://"):
+                  auth_url = url.replace("https://", f"https://x-access-token:{token}@", 1)
+                  cmd[-1] = auth_url
+
+              try:
+                  subprocess.run(cmd, check=True, capture_output=True, text=True)
+              except subprocess.CalledProcessError as e:
+                  print(f"Clone failed: {e.stderr.strip()[:400]}")
+                  shutil.rmtree(src_clone, ignore_errors=True)
+                  continue
+
+              if mode == "full":
+                  # full模式优先手动name，没有则自动取仓库名
+                  target_name = manual_name if manual_name else repo_name
+                  target = SKILLS_DIR / target_name
+                  if target.exists():
+                      shutil.rmtree(target)
+                  target.mkdir()
+                  for p in src_clone.iterdir():
+                      if p.name == ".git":
+                          continue
+                      shutil.move(str(p), str(target / p.name))
+                  synced_entries.add(target_name)
+                  print(f"✅ full -> skills/{target_name}/")
+
+              elif mode == "subdir":
+                  src_sub = src_clone / subdir
+                  if not src_sub.exists():
+                      print(f"⚠️ subdir {subdir} not found in repo, skip")
+                      shutil.rmtree(src_clone, ignore_errors=True)
+                      continue
+                  # subdir：只复制子目录，跳过文件
+                  for p in src_sub.iterdir():
+                      if not p.is_dir():
+                          print(f"  skip file (only dir allowed): {p.name}")
+                          continue
+                      src_dir_name = p.name
+                      dest_dir_name = dir_map.get(src_dir_name, src_dir_name)
+                      dest = SKILLS_DIR / dest_dir_name
+                      if dest.exists():
+                          shutil.rmtree(dest)
+                      shutil.move(str(p), str(dest))
+                      synced_entries.add(dest_dir_name)
+                      print(f"  copied dir: {src_dir_name} => skills/{dest_dir_name}")
+                  print(f"✅ subdir dirs merged into skills/")
+              else:
+                  print(f"❌ unknown mode {mode}, skip")
+
+              shutil.rmtree(src_clone, ignore_errors=True)
+
+          # 清理skills目录不在本次同步条目的旧内容
+          print("\n====> Cleanup old entries in skills/")
+          for entry in SKILLS_DIR.iterdir():
+              if entry.name not in synced_entries:
+                  print(f"Remove old: skills/{entry.name}")
+                  if entry.is_dir():
+                      shutil.rmtree(entry)
+                  else:
+                      entry.unlink()
+
+          shutil.rmtree(TMP, ignore_errors=True)
+          print("\nSync done.")
+          PY
+
+      - name: Commit & Push
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add skills/ repos.config.yml
+          if git diff --staged --quiet; then
+            echo "No changes"
+          else
+            git commit -m "chore: sync skills $(date -u +%Y-%m-%d)"
+            git push
+          fi
