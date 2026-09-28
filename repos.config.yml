@@ -1,3 +1,5 @@
 repos:
   - url: https://github.com/kangarooking/cangjie-skill.git
     mode: full
+  - url: https://github.com/isjiamu/gzh-design-skill.git
+    mode: full
